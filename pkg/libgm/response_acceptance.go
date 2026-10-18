@@ -22,6 +22,25 @@ var ErrNoResponsePayload = errors.New("phone answered without a response payload
 // response after the phone has answered it with a payload-less frame.
 const DefaultResponsePayloadGrace = 10 * time.Second
 
+// DefaultResponseDeadline is how long a request keeps waiting for any answer at
+// all before it fails. Without it a lost response blocks the caller forever: the
+// outbound POST returns as soon as the phone acknowledges it, so no HTTP timeout
+// covers the out-of-band payload wait.
+const DefaultResponseDeadline = 60 * time.Second
+
+// ResponseTimeoutError is returned when a request received no terminal answer
+// before the response deadline. Callers can retry on it.
+type ResponseTimeoutError struct {
+	// RequestID is the request that timed out.
+	RequestID string
+	// Waited is how long the request waited from send to giving up.
+	Waited time.Duration
+}
+
+func (e *ResponseTimeoutError) Error() string {
+	return fmt.Sprintf("no response to request %s after %s", e.RequestID, e.Waited.Round(time.Millisecond))
+}
+
 // payloadRequired lists the read actions whose answer only ever arrives in the
 // encrypted response payload (RPCMessageData field 8). Actions outside this set
 // (sends, liveness pings, updates) keep the original first-matching-frame
@@ -222,6 +241,21 @@ func (c *Client) SetResponsePayloadGrace(grace time.Duration) {
 	if grace > 0 {
 		c.sessionHandler.payloadGrace.Store(int64(grace))
 	}
+}
+
+// SetResponseDeadline overrides how long a request waits for any answer before
+// it fails with ResponseTimeoutError. Zero or negative leaves the default.
+func (c *Client) SetResponseDeadline(deadline time.Duration) {
+	if deadline > 0 {
+		c.sessionHandler.responseDeadline.Store(int64(deadline))
+	}
+}
+
+func (s *SessionHandler) responseDeadlineOr() time.Duration {
+	if deadline := time.Duration(s.responseDeadline.Load()); deadline > 0 {
+		return deadline
+	}
+	return DefaultResponseDeadline
 }
 
 func (s *SessionHandler) responsePayloadGrace() time.Duration {

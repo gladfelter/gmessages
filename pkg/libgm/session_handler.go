@@ -22,6 +22,7 @@ type SessionHandler struct {
 	responseWaiters     map[string]*responseWaiter
 	responseWaitersLock sync.Mutex
 	payloadGrace        atomic.Int64 // time.Duration; 0 = DefaultResponsePayloadGrace
+	responseDeadline    atomic.Int64 // time.Duration; 0 = DefaultResponseDeadline
 
 	ackMapLock sync.Mutex
 	ackMap     []string
@@ -237,7 +238,10 @@ func (s *SessionHandler) sendMessageWithParams(params SendMessageParams) (*Incom
 }
 
 // waitForResponse waits for the request's terminal message: a response, or
-// the payload error that expirePayloadWait delivers.
+// the payload error that expirePayloadWait delivers. A request that receives
+// neither fails after the response deadline instead of blocking forever: the
+// outbound POST returns as soon as the phone acknowledges it, so the payload
+// arrives out of band and no HTTP timeout covers this wait.
 func (s *SessionHandler) waitForResponse(requestID string, ch <-chan *IncomingRPCMessage) (*IncomingRPCMessage, error) {
 	var resp *IncomingRPCMessage
 	select {
@@ -252,13 +256,42 @@ func (s *SessionHandler) waitForResponse(requestID string, ch <-chan *IncomingRP
 			default:
 			}
 		}
-		// TODO hard timeout?
-		resp = <-ch
+		deadline := s.responseDeadlineOr()
+		select {
+		case resp = <-ch:
+		case <-time.After(deadline):
+			// Unregister so a late frame is logged as an answer nobody waits
+			// for instead of filling a channel no one reads.
+			s.abandonResponse(requestID)
+			err := &ResponseTimeoutError{RequestID: requestID, Waited: 5*time.Second + deadline}
+			s.client.Logger.Warn().
+				Str("request_message_id", requestID).
+				Dur("waited", err.Waited).
+				Msg("Phone never answered the request; failing it on the response deadline")
+			return nil, err
+		}
 	}
 	if resp != nil && resp.payloadErr != nil {
 		return nil, resp.payloadErr
 	}
 	return resp, nil
+}
+
+// abandonResponse unregisters a request whose caller gave up. It deliberately
+// does not close the channel: expirePayloadWait sends on it after releasing the
+// lock, so closing here could panic. A frame that already claimed the waiter
+// still lands in the one-element buffer and is collected with it.
+func (s *SessionHandler) abandonResponse(requestID string) {
+	s.responseWaitersLock.Lock()
+	defer s.responseWaitersLock.Unlock()
+	w, ok := s.responseWaiters[requestID]
+	if !ok {
+		return
+	}
+	if w.graceTimer != nil {
+		w.graceTimer.Stop()
+	}
+	delete(s.responseWaiters, requestID)
 }
 
 func (s *SessionHandler) sendMessage(actionType gmproto.ActionType, encryptedData proto.Message) (*IncomingRPCMessage, error) {
